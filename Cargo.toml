@@ -1,0 +1,14 @@
+[package]
+name = "sglang-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+axum-valid = { version = "0.25", features = ["validator", "into_json"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+validator = { version = "0.20", features = ["derive"] }
+pyo3 = { version = "0.28", features = ["auto-initialize"] }
