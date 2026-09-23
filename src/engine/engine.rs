@@ -17,6 +17,7 @@ use super::kvcache::{
     KVCacheServerConfig,
 };
 use super::sampling::{Sampler, SamplingError, SamplingParams};
+use super::{Batch, ModelRunner, ModelRunnerError};
 
 /// Server-side settings consumed by [`Engine`].
 ///
@@ -68,7 +69,9 @@ pub enum EngineError {
     ModelPathIsNotDirectory(PathBuf),
     MissingModelConfig(PathBuf),
     KVCache(KVCacheError),
+    ModelRunner(ModelRunnerError),
     Sampling(SamplingError),
+    ModelRunnerNotAttached,
     Released,
     NotImplemented(&'static str),
 }
@@ -91,7 +94,9 @@ impl fmt::Display for EngineError {
                 path.display()
             ),
             Self::KVCache(error) => write!(f, "KV cache 初始化失败: {error}"),
+            Self::ModelRunner(error) => write!(f, "模型前向失败: {error}"),
             Self::Sampling(error) => write!(f, "采样失败: {error}"),
+            Self::ModelRunnerNotAttached => write!(f, "Engine 尚未绑定 ModelRunner"),
             Self::Released => write!(f, "Engine 已清理，不能再使用"),
             Self::NotImplemented(feature) => write!(f, "未实现: {feature}"),
         }
@@ -112,6 +117,12 @@ impl From<SamplingError> for EngineError {
     }
 }
 
+impl From<ModelRunnerError> for EngineError {
+    fn from(error: ModelRunnerError) -> Self {
+        Self::ModelRunner(error)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, EngineError>;
 
 /// Owns Rust-side engine state during the gradual migration.
@@ -122,6 +133,7 @@ pub struct Engine {
     device: Device,
     kind: Kind,
     kv_cache_pool: Option<KVCachePool>,
+    model_runner: Option<ModelRunner>,
     sampler: Sampler,
 }
 
@@ -169,6 +181,7 @@ impl Engine {
             device,
             kind,
             kv_cache_pool: Some(kv_cache_pool),
+            model_runner: None,
             sampler: Sampler,
         })
     }
@@ -201,17 +214,44 @@ impl Engine {
         self.kv_cache_pool.as_mut().ok_or(EngineError::Released)
     }
 
+    /// Binds the migrated eager execution path after the Rust model is built.
+    pub fn attach_model_runner(&mut self, model_runner: ModelRunner) -> Result<()> {
+        self.ensure_live()?;
+        if model_runner.device() != self.device {
+            return Err(EngineError::InvalidArgument(format!(
+                "ModelRunner device ({:?}) must match Engine device ({:?})",
+                model_runner.device(),
+                self.device
+            )));
+        }
+        self.model_runner = Some(model_runner);
+        Ok(())
+    }
+
+    pub fn model_runner(&self) -> Result<&ModelRunner> {
+        self.ensure_live()?;
+        self.model_runner
+            .as_ref()
+            .ok_or(EngineError::ModelRunnerNotAttached)
+    }
+
     /// Releases Rust-owned accelerator memory. Calling it repeatedly is safe.
     pub fn cleanup(&mut self) {
+        if let Some(model_runner) = &mut self.model_runner {
+            model_runner.clear_graphs();
+        }
+        self.model_runner.take();
         self.kv_cache_pool.take();
     }
 
-    /// Reserved for the migrated `ModelRunner` and scheduler `Batch`.
-    pub fn forward(&self, _input_ids: &Tensor, _positions: &Tensor) -> Result<Tensor> {
+    /// Executes a scheduler-prepared batch through the attached ModelRunner.
+    pub fn forward(&self, batch: &Batch) -> Result<Tensor> {
         self.ensure_live()?;
-        Err(EngineError::NotImplemented(
-            "Rust ModelRunner / Batch 前向执行",
-        ))
+        Ok(self
+            .model_runner
+            .as_ref()
+            .ok_or(EngineError::ModelRunnerNotAttached)?
+            .forward(batch)?)
     }
 
     /// Samples one token per logits row using request-aligned parameters.
@@ -280,6 +320,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use super::super::{AttentionMetadata, ModelExecutor};
     use super::*;
 
     fn model_dir() -> PathBuf {
@@ -371,6 +412,45 @@ mod tests {
                 .sample(&logits, &[SamplingParams::default()])
                 .unwrap(),
             vec![1]
+        );
+        fs::remove_dir_all(model_dir).unwrap();
+    }
+
+    struct EchoModel;
+
+    impl ModelExecutor for EchoModel {
+        fn forward(
+            &self,
+            input_ids: &Tensor,
+            _positions: &Tensor,
+            _attention_metadata: Option<&AttentionMetadata>,
+            _logits_indices: Option<&Tensor>,
+        ) -> std::result::Result<Tensor, ModelRunnerError> {
+            Ok(input_ids.shallow_clone())
+        }
+    }
+
+    #[test]
+    fn delegates_forward_to_an_attached_model_runner() {
+        let model_dir = model_dir();
+        let mut args = ServerArgs::new(&model_dir);
+        args.max_running_req = 1;
+        args.max_seq_len = 2;
+        args.page_size = 2;
+        let mut engine = Engine::new(args, model_args(), 0).unwrap();
+        engine
+            .attach_model_runner(ModelRunner::new(Box::new(EchoModel), Device::Cpu))
+            .unwrap();
+        let batch = Batch::prefill(
+            Tensor::from_slice(&[10i64, 11]),
+            Tensor::from_slice(&[0i64, 1]),
+            None,
+            Tensor::from_slice(&[1i64]),
+        );
+
+        assert_eq!(
+            Vec::<i64>::try_from(&engine.forward(&batch).unwrap()).unwrap(),
+            vec![10, 11]
         );
         fs::remove_dir_all(model_dir).unwrap();
     }
