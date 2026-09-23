@@ -70,3 +70,30 @@ LIBTORCH_USE_PYTORCH=1 \
 DYLD_LIBRARY_PATH=/Users/dp/code/sglang-rust/.venv/lib/python3.12/site-packages/torch/lib \
 cargo test --lib
 ```
+
+## Engine
+
+`src/engine/engine.rs` 提供了 `mini-sglang` `Engine` 的 Rust 生命周期骨架：它会校验本地 Hugging Face 模型目录、将 `max_seq_len` 收敛到模型的上下文窗口，并通过已迁移的 `KVCacheAllocator` 创建和释放 libtorch KV Cache。
+
+模型构建与权重加载、`ModelRunner` / scheduler `Batch` 前向、CUDA Graph 和分布式张量并行还未迁移；调用 `Engine::forward` 或指定 `tp_size > 1` 会返回明确的 `未实现` 错误，而不会产生不完整推理结果。
+
+`Engine::sample(&logits, &params)` 已接入 Rust `Sampler`。`logits` 为 `(num_reqs, vocab_size)`，`params` 必须有同样数量的 `SamplingParams`；它支持 greedy、temperature、top-k 与 top-p，并将相同采样参数的请求合并为一次 libtorch 调用。
+
+## TokenizerWorker
+
+`src/tokenizer.rs` 使用 Hugging Face 的原生 Rust `tokenizers` crate 加载模型目录中的 `tokenizer.json`，不需要 Python 或 `transformers` 运行时：
+
+```rust
+use sglang_rust::tokenizer::{ChatMessage, TokenizerWorker};
+
+let worker = TokenizerWorker::new("/path/to/model", false)?;
+let ids = worker.encode("hello")?;
+let text = worker.decode(&ids, true)?;
+let prompt = worker.apply_chat_template(
+    &[ChatMessage::new("user", "hello")],
+    true,
+)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+模型目录中的 `tokenizer_config.json` 若包含字符串形式的 `chat_template`，会以 Jinja 语法渲染，并提供 `messages` 与 `add_generation_prompt`。没有模板时，保持 mini-sglang 原始实现的回退行为：以空行拼接非空消息内容。`trust_remote_code=true` 和非字符串模板配置会明确返回 `未实现` 错误；原生 Rust 加载器不会执行 Python 远程代码。
