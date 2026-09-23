@@ -83,7 +83,29 @@ cargo test --lib
 
 `BatchContext::prepare_prefill` 会把 scheduler 请求的未缓存 token 拼接为 `Batch`，并生成 `write_loc`、`cu_seqlens_q`、`prefix_lens`、`block_table`、`req_to_token` 与 `logits_indices`。这部分不依赖模型结构，已使用 libtorch Tensor 实现。
 
-`load_hf_safetensors` 支持读取 `model.safetensors` 或 `model.safetensors.index.json` 所列的 shards。`Engine::build_model(&factory)` 通过未来模型层提供的 `ModelFactory` 创建 Rust 模型，随后 `Engine::load_model_weights()` 把实际读取到的具名 Tensor 交给 `ModelExecutor::load_weights` 绑定。Qwen 等 Rust 模型架构和权重键映射尚未迁移，因此当前没有内置 factory；未实现绑定的模型会明确报错。
+`load_hf_safetensors` 支持读取 `model.safetensors` 或 `model.safetensors.index.json` 所列的 shards。`Engine::build_model(&factory)` 通过模型层提供的 `ModelFactory` 创建 Rust 模型，随后 `Engine::load_model_weights()` 把实际读取到的具名 Tensor 交给 `ModelExecutor::load_weights` 绑定；未实现绑定的模型会明确报错。
+
+## Qwen3（dense）
+
+`models::Qwen3Factory` 已实现 dense Qwen3 的 RMSNorm、SwiGLU、QK-RMSNorm、RoPE、GQA 与因果注意力，并按 Hugging Face 标准权重键加载：
+
+```rust
+use sglang_rust::{
+    engine::{Engine, ModelArgs, ServerArgs},
+    models::Qwen3Factory,
+};
+
+let model_path = "/path/to/qwen3";
+let model_args = ModelArgs::from_pretrained(model_path)?;
+let mut engine = Engine::new(ServerArgs::new(model_path), model_args, 0)?;
+engine.build_model(&Qwen3Factory)?;
+engine.load_model_weights()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+当前 dense Qwen3 支持 eager prefill、带缓存前缀的 prefill 和 paged-KV decode；模型接入 `Engine` 时会自动绑定 `KVCachePool` 的逐层 K/V 切片。Qwen3-MoE 与张量并行尚未迁移，调用时会返回明确错误。
+
+Attention 通过 `ServerArgs::attention_backend` 选择后端，当前默认且唯一可执行的值是 `"pt"`。`"fa"` / `"flashattention"` 已保留为同一抽象的占位后端，调用时会返回未实现错误，便于后续接入 FlashAttention binding 而无需改动 Qwen3 层。
 
 ## TokenizerWorker
 

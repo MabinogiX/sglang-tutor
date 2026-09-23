@@ -65,6 +65,18 @@ pub trait ModelFactory {
         kind: Kind,
         device: Device,
     ) -> std::result::Result<Box<dyn ModelExecutor>, ModelRunnerError>;
+
+    /// Creates a model with the engine-selected attention implementation.
+    /// Factories without native attention can use the compatibility default.
+    fn create_with_attention_backend(
+        &self,
+        model_args: ModelArgs,
+        kind: Kind,
+        device: Device,
+        _attention_backend: &str,
+    ) -> std::result::Result<Box<dyn ModelExecutor>, ModelRunnerError> {
+        self.create(model_args, kind, device)
+    }
 }
 
 /// Named tensors read from a Hugging Face safetensors checkpoint.

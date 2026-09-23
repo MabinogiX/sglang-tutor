@@ -46,19 +46,124 @@ impl ServerArgs {
             max_seq_len: 8192,
             page_size: 16,
             dtype: "auto".to_owned(),
-            attention_backend: "fa".to_owned(),
+            attention_backend: "pt".to_owned(),
             trust_remote_code: false,
         }
     }
 }
 
 /// Model architecture values required to size the KV cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelArgs {
+    pub hidden_size: usize,
     pub num_layers: usize,
+    pub num_attention_heads: usize,
     pub num_kv_heads: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
     pub head_dim: usize,
     pub max_position_embeddings: usize,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+    pub tie_word_embeddings: bool,
+    pub qk_norm: bool,
+}
+
+impl Default for ModelArgs {
+    fn default() -> Self {
+        Self {
+            hidden_size: 0,
+            num_layers: 0,
+            num_attention_heads: 0,
+            num_kv_heads: 0,
+            intermediate_size: 0,
+            vocab_size: 0,
+            head_dim: 0,
+            max_position_embeddings: 8192,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            qk_norm: false,
+        }
+    }
+}
+
+impl ModelArgs {
+    /// Reads Qwen-compatible architecture fields from Hugging Face `config.json`.
+    pub fn from_pretrained(model_path: impl AsRef<Path>) -> Result<Self> {
+        let config_path = model_path.as_ref().join("config.json");
+        let contents = std::fs::read_to_string(&config_path).map_err(|error| {
+            EngineError::InvalidModelConfig {
+                path: config_path.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let config: serde_json::Value =
+            serde_json::from_str(&contents).map_err(|error| EngineError::InvalidModelConfig {
+                path: config_path.clone(),
+                message: error.to_string(),
+            })?;
+        let required_usize = |name: &str| -> Result<usize> {
+            config
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| EngineError::InvalidModelConfig {
+                    path: config_path.clone(),
+                    message: format!("missing or invalid integer field {name}"),
+                })
+        };
+        let optional_usize = |name: &str, default: usize| -> Result<usize> {
+            match config.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(default),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| EngineError::InvalidModelConfig {
+                        path: config_path.clone(),
+                        message: format!("invalid integer field {name}"),
+                    }),
+            }
+        };
+        let hidden_size = required_usize("hidden_size")?;
+        let num_attention_heads = required_usize("num_attention_heads")?;
+        let head_dim = optional_usize(
+            "head_dim",
+            hidden_size
+                .checked_div(num_attention_heads)
+                .ok_or_else(|| EngineError::InvalidModelConfig {
+                    path: config_path.clone(),
+                    message: "num_attention_heads must be greater than zero".to_owned(),
+                })?,
+        )?;
+
+        Ok(Self {
+            hidden_size,
+            num_layers: optional_usize("num_hidden_layers", 0)?,
+            num_attention_heads,
+            num_kv_heads: optional_usize("num_key_value_heads", num_attention_heads)?,
+            intermediate_size: optional_usize("intermediate_size", 0)?,
+            vocab_size: optional_usize("vocab_size", 0)?,
+            head_dim,
+            max_position_embeddings: optional_usize("max_position_embeddings", 8192)?,
+            rope_theta: config
+                .get("rope_theta")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(10_000.0),
+            rms_norm_eps: config
+                .get("rms_norm_eps")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1e-6),
+            tie_word_embeddings: config
+                .get("tie_word_embeddings")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            qk_norm: config
+                .get("qk_norm")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
 }
 
 /// Engine construction and lifecycle failures.
@@ -68,6 +173,7 @@ pub enum EngineError {
     ModelPathDoesNotExist(PathBuf),
     ModelPathIsNotDirectory(PathBuf),
     MissingModelConfig(PathBuf),
+    InvalidModelConfig { path: PathBuf, message: String },
     KVCache(KVCacheError),
     ModelRunner(ModelRunnerError),
     Sampling(SamplingError),
@@ -93,6 +199,9 @@ impl fmt::Display for EngineError {
                 "模型目录没有 config.json: {}。这不是 Hugging Face 模型目录。",
                 path.display()
             ),
+            Self::InvalidModelConfig { path, message } => {
+                write!(f, "无效的模型配置 {}: {message}", path.display())
+            }
             Self::KVCache(error) => write!(f, "KV cache 初始化失败: {error}"),
             Self::ModelRunner(error) => write!(f, "模型前向失败: {error}"),
             Self::Sampling(error) => write!(f, "采样失败: {error}"),
@@ -224,6 +333,9 @@ impl Engine {
                 self.device
             )));
         }
+        let (k_cache, v_cache) = self.kv_cache_pool()?.get_all_kv_cache()?;
+        let mut model_runner = model_runner;
+        model_runner.bind_kv_cache(k_cache, v_cache)?;
         self.model_runner = Some(model_runner);
         Ok(())
     }
@@ -238,7 +350,12 @@ impl Engine {
     /// Creates the selected Rust model and binds it to this Engine.
     pub fn build_model(&mut self, factory: &dyn ModelFactory) -> Result<()> {
         self.ensure_live()?;
-        let model = factory.create(self.model_args, self.kind, self.device)?;
+        let model = factory.create_with_attention_backend(
+            self.model_args,
+            self.kind,
+            self.device,
+            &self.server_args.attention_backend,
+        )?;
         self.attach_model_runner(ModelRunner::new(model, self.device))
     }
 
@@ -364,6 +481,7 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 1,
             max_position_embeddings: 4,
+            ..Default::default()
         }
     }
 
@@ -406,6 +524,34 @@ mod tests {
             validate_parallelism(2, 2),
             Err(EngineError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn parses_qwen_architecture_from_hugging_face_config() {
+        let path = model_dir();
+        fs::write(
+            path.join("config.json"),
+            r#"{
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "intermediate_size": 32,
+                "vocab_size": 64,
+                "max_position_embeddings": 128,
+                "rope_theta": 1000000.0,
+                "rms_norm_eps": 0.00001,
+                "tie_word_embeddings": true,
+                "qk_norm": true
+            }"#,
+        )
+        .unwrap();
+
+        let args = ModelArgs::from_pretrained(&path).unwrap();
+        assert_eq!(args.head_dim, 4);
+        assert_eq!(args.num_kv_heads, 2);
+        assert!(args.tie_word_embeddings);
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

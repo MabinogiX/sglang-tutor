@@ -18,8 +18,8 @@ pub enum BatchPhase {
 
 /// Per-batch attention tensors passed through the model stack.
 ///
-/// The fields mirror mini-sglang's `AttentionMetadata`. Attention kernels are
-/// migrated separately, so this is intentionally a transport type.
+/// The fields mirror mini-sglang's `AttentionMetadata`. Models consume the
+/// page-table fields to perform eager paged-KV reads and writes.
 #[derive(Debug)]
 pub struct AttentionMetadata {
     pub forward_mode: BatchPhase,
@@ -95,6 +95,12 @@ pub trait ModelExecutor {
             "该 Rust 模型尚未实现 Hugging Face 权重绑定".to_owned(),
         ))
     }
+
+    /// Binds `(layers, pages, page_size, kv_heads, head_dim)` cache views.
+    /// Cache-less executors may keep the default no-op implementation.
+    fn bind_kv_cache(&mut self, _k_cache: Tensor, _v_cache: Tensor) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -156,6 +162,10 @@ impl ModelRunner {
     /// Hands loaded Hugging Face tensors to the concrete model architecture.
     pub fn load_weights(&mut self, weights: ModelWeights) -> Result<usize> {
         self.model.load_weights(weights)
+    }
+
+    pub fn bind_kv_cache(&mut self, k_cache: Tensor, v_cache: Tensor) -> Result<()> {
+        self.model.bind_kv_cache(k_cache, v_cache)
     }
 
     /// The single model-forward entry point retained for future GraphRunner use.
