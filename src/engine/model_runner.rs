@@ -7,6 +7,8 @@ use std::fmt;
 
 use tch::{Device, TchError, Tensor, no_grad};
 
+use super::ModelWeights;
+
 /// Identifies the scheduler phase that produced a [`Batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
@@ -18,8 +20,9 @@ pub enum BatchPhase {
 ///
 /// The fields mirror mini-sglang's `AttentionMetadata`. Attention kernels are
 /// migrated separately, so this is intentionally a transport type.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AttentionMetadata {
+    pub forward_mode: BatchPhase,
     pub write_loc: Option<Tensor>,
     pub cu_seqlens_q: Option<Tensor>,
     pub prefix_lens: Option<Tensor>,
@@ -83,6 +86,15 @@ pub trait ModelExecutor {
         attention_metadata: Option<&AttentionMetadata>,
         logits_indices: Option<&Tensor>,
     ) -> Result<Tensor>;
+
+    /// Receives native Hugging Face checkpoint tensors after model assembly.
+    /// Concrete model architectures override this when their parameter naming
+    /// and tensor-parallel sharding rules have been migrated.
+    fn load_weights(&mut self, _weights: ModelWeights) -> Result<usize> {
+        Err(ModelRunnerError::Model(
+            "该 Rust 模型尚未实现 Hugging Face 权重绑定".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -139,6 +151,11 @@ impl ModelRunner {
 
     pub fn device(&self) -> Device {
         self.device
+    }
+
+    /// Hands loaded Hugging Face tensors to the concrete model architecture.
+    pub fn load_weights(&mut self, weights: ModelWeights) -> Result<usize> {
+        self.model.load_weights(weights)
     }
 
     /// The single model-forward entry point retained for future GraphRunner use.

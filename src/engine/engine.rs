@@ -17,7 +17,7 @@ use super::kvcache::{
     KVCacheServerConfig,
 };
 use super::sampling::{Sampler, SamplingError, SamplingParams};
-use super::{Batch, ModelRunner, ModelRunnerError};
+use super::{Batch, ModelFactory, ModelRunner, ModelRunnerError, load_hf_safetensors};
 
 /// Server-side settings consumed by [`Engine`].
 ///
@@ -235,6 +235,26 @@ impl Engine {
             .ok_or(EngineError::ModelRunnerNotAttached)
     }
 
+    /// Creates the selected Rust model and binds it to this Engine.
+    pub fn build_model(&mut self, factory: &dyn ModelFactory) -> Result<()> {
+        self.ensure_live()?;
+        let model = factory.create(self.model_args, self.kind, self.device)?;
+        self.attach_model_runner(ModelRunner::new(model, self.device))
+    }
+
+    /// Reads local Hugging Face safetensors and binds them to the attached model.
+    pub fn load_model_weights(&mut self) -> Result<usize> {
+        self.ensure_live()?;
+        let weights = load_hf_safetensors(&self.server_args.model_path).map_err(|error| {
+            EngineError::InvalidArgument(format!("Hugging Face 权重加载失败: {error}"))
+        })?;
+        Ok(self
+            .model_runner
+            .as_mut()
+            .ok_or(EngineError::ModelRunnerNotAttached)?
+            .load_weights(weights)?)
+    }
+
     /// Releases Rust-owned accelerator memory. Calling it repeatedly is safe.
     pub fn cleanup(&mut self) {
         if let Some(model_runner) = &mut self.model_runner {
@@ -317,18 +337,22 @@ fn validate_parallelism(tp_size: usize, tp_rank: usize) -> Result<()> {
 mod tests {
     use std::{
         fs,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::super::{AttentionMetadata, ModelExecutor};
+    use super::super::{AttentionMetadata, ModelExecutor, ModelFactory, ModelWeights};
     use super::*;
+
+    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     fn model_dir() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock must be after UNIX epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("sglang-rust-engine-{nonce}"));
+        let id = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("sglang-rust-engine-{nonce}-{id}"));
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("config.json"), "{}").unwrap();
         path
@@ -430,6 +454,40 @@ mod tests {
         }
     }
 
+    struct LoadingModel;
+
+    impl ModelExecutor for LoadingModel {
+        fn forward(
+            &self,
+            input_ids: &Tensor,
+            _positions: &Tensor,
+            _attention_metadata: Option<&AttentionMetadata>,
+            _logits_indices: Option<&Tensor>,
+        ) -> std::result::Result<Tensor, ModelRunnerError> {
+            Ok(input_ids.shallow_clone())
+        }
+
+        fn load_weights(
+            &mut self,
+            weights: ModelWeights,
+        ) -> std::result::Result<usize, ModelRunnerError> {
+            Ok(weights.len())
+        }
+    }
+
+    struct LoadingFactory;
+
+    impl ModelFactory for LoadingFactory {
+        fn create(
+            &self,
+            _model_args: ModelArgs,
+            _kind: Kind,
+            _device: Device,
+        ) -> std::result::Result<Box<dyn ModelExecutor>, ModelRunnerError> {
+            Ok(Box::new(LoadingModel))
+        }
+    }
+
     #[test]
     fn delegates_forward_to_an_attached_model_runner() {
         let model_dir = model_dir();
@@ -452,6 +510,26 @@ mod tests {
             Vec::<i64>::try_from(&engine.forward(&batch).unwrap()).unwrap(),
             vec![10, 11]
         );
+        fs::remove_dir_all(model_dir).unwrap();
+    }
+
+    #[test]
+    fn builds_a_model_and_loads_hugging_face_safetensors() {
+        let model_dir = model_dir();
+        let weight = Tensor::ones([2], (Kind::Float, Device::Cpu));
+        Tensor::write_safetensors(
+            &[("lm_head.weight", &weight)],
+            model_dir.join("model.safetensors"),
+        )
+        .unwrap();
+        let mut args = ServerArgs::new(&model_dir);
+        args.max_running_req = 1;
+        args.max_seq_len = 2;
+        args.page_size = 2;
+        let mut engine = Engine::new(args, model_args(), 0).unwrap();
+
+        engine.build_model(&LoadingFactory).unwrap();
+        assert_eq!(engine.load_model_weights().unwrap(), 1);
         fs::remove_dir_all(model_dir).unwrap();
     }
 }
