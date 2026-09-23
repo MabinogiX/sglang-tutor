@@ -1,6 +1,6 @@
 # 最小 Axum API 服务器
 
-一个不依赖 Python 或 PyTorch 的 Rust HTTP 服务示例。
+一个使用 Axum 与 libtorch Rust bindings 的 Rust HTTP 服务示例。
 
 ## 运行
 
@@ -56,15 +56,17 @@ controller 只处理 HTTP 层的输入和输出，并调用 service；service �
 `src/engine/kvcache/` 已包含 Rust 版本的 `BaseCacheHandle`、`CacheManager` trait、`KVCachePool` 与 `KVCacheAllocator`：
 
 - 页表、空闲页栈、内存页数计算由 Rust 管理；
-- `KVCachePool::new` 仍使用 Python 的 `torch.empty` 创建 `(2, layers, pages, page_size, kv_heads, head_dim)` Tensor；
-- `get_all_kv_cache` 返回 Python 的 K/V Tensor，供之后迁移的 attention 层使用；
+- `KVCachePool::new` 使用 `tch::Tensor::f_empty` 创建 `(2, layers, pages, page_size, kv_heads, head_dim)` Tensor；
+- `get_all_kv_cache` 返回 `tch::Tensor` K/V 切片，供之后迁移的 attention 层使用；
 - `RadixCacheManager` 已迁移，支持页对齐前缀匹配、共享前缀引用计数、插入回滚、请求释放和页粒度驱逐；
-- Naive cache manager、Python attention layer 绑定，以及 CUDA/NPU 空闲显存查询尚未迁移；调用相应入口会返回 `未实现` 错误。
+- Naive cache manager、Rust attention layer 绑定，以及加速器空闲显存查询尚未迁移；调用相应入口会返回 `未实现` 错误。
 
-本机运行涉及 Torch 的测试时，需要让嵌入式 Python 找到原项目的虚拟环境：
+本机使用 `tch-rs` 构建时，需将 `LIBTORCH_USE_PYTORCH=1` 指向含 libtorch 的 Python 环境。`tch 0.26` 的官方目标版本是 PyTorch/libtorch 2.13，本项目当前环境为 2.13.0。macOS 运行时还需设置 `DYLD_LIBRARY_PATH`，让动态链接器找到 libtorch：
 
 ```bash
-PYTHONPATH=/Users/dp/code/mini-sglang/.venv/lib/python3.12/site-packages \
-PYO3_PYTHON=/Users/dp/code/mini-sglang/.venv/bin/python \
-cargo test --lib -- --ignored
+VIRTUAL_ENV=/Users/dp/code/sglang-rust/.venv \
+PATH=/Users/dp/code/sglang-rust/.venv/bin:$PATH \
+LIBTORCH_USE_PYTORCH=1 \
+DYLD_LIBRARY_PATH=/Users/dp/code/sglang-rust/.venv/lib/python3.12/site-packages/torch/lib \
+cargo test --lib
 ```

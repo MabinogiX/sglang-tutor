@@ -11,4 +11,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 validator = { version = "0.20", features = ["derive"] }
-pyo3 = { version = "0.28", features = ["auto-initialize"] }
+tch = "0.26"

@@ -1,7 +1,4 @@
-use pyo3::{
-    Bound, Py, Python,
-    types::{PyAny, PyAnyMethods, PyDict, PyDictMethods, PyModule},
-};
+use tch::{Device, Kind, Tensor};
 
 use super::{KVCacheError, Result};
 
@@ -66,42 +63,46 @@ impl KVCacheLayout {
         Ok(layout)
     }
 
-    fn tensor_shape(self) -> (usize, usize, usize, usize, usize, usize) {
-        (
+    fn tensor_shape(self) -> Result<[i64; 6]> {
+        [
             2,
             self.num_layers,
             self.num_pages,
             self.page_size,
             self.num_kv_heads,
             self.head_dim,
-        )
+        ]
+        .map(|dimension| {
+            i64::try_from(dimension).map_err(|_| {
+                KVCacheError::InvalidArgument("KV-cache dimension exceeds i64".to_owned())
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .and_then(|dimensions| {
+            dimensions.try_into().map_err(|_| {
+                KVCacheError::InvalidArgument("invalid KV-cache tensor rank".to_owned())
+            })
+        })
     }
 }
 
-/// Owns page allocation state and a Python-owned Torch buffer.
+/// Owns page allocation state and a libtorch-backed K/V buffer.
 pub struct KVCachePool {
     pub layout: KVCacheLayout,
-    buffer: Option<Py<PyAny>>,
+    buffer: Option<Tensor>,
     free_pages: Vec<usize>,
 }
 
 impl KVCachePool {
-    /// Allocate the backing tensor with `torch.empty`.
-    pub fn new(
-        py: Python<'_>,
-        layout: KVCacheLayout,
-        dtype: &Bound<'_, PyAny>,
-        device: &str,
-    ) -> Result<Self> {
-        let torch = PyModule::import(py, "torch")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("dtype", dtype)?;
-        kwargs.set_item("device", device)?;
-        let buffer = torch.call_method("empty", (layout.tensor_shape(),), Some(&kwargs))?;
+    /// Allocate the backing tensor with libtorch's `at::empty`.
+    pub fn new(layout: KVCacheLayout, kind: Kind, device: Device) -> Result<Self> {
+        let shape = layout.tensor_shape()?;
+        let buffer = Tensor::f_empty(shape, (kind, device))?;
 
         Ok(Self {
             layout,
-            buffer: Some(buffer.unbind()),
+            buffer: Some(buffer),
             free_pages: (0..layout.num_pages).collect(),
         })
     }
@@ -151,19 +152,18 @@ impl KVCachePool {
 
     /// Return `(k_cache, v_cache)`, each shaped
     /// `(num_layers, num_pages, page_size, num_kv_heads, head_dim)`.
-    pub fn get_all_kv_cache(&self, py: Python<'_>) -> Result<(Py<PyAny>, Py<PyAny>)> {
+    pub fn get_all_kv_cache(&self) -> Result<(Tensor, Tensor)> {
         let buffer = self.buffer.as_ref().ok_or(KVCacheError::NotImplemented(
-            "无 Python/Torch buffer 的 KVCachePool 不能提供 K/V tensor",
+            "无 libtorch buffer 的 KVCachePool 不能提供 K/V tensor",
         ))?;
-        let buffer = buffer.bind(py);
-        Ok((buffer.get_item(0)?.unbind(), buffer.get_item(1)?.unbind()))
+        Ok((buffer.f_get(0)?, buffer.f_get(1)?))
     }
 
-    /// Binding Rust-owned pools to Python attention modules awaits migration of
-    /// the model layer and remains deliberately unsupported for this step.
-    pub fn bind_layers(&self, _py: Python<'_>, _model: &Bound<'_, PyAny>) -> Result<()> {
+    /// Binding the pool to Rust attention modules awaits migration of the model
+    /// layer and remains deliberately unsupported for this step.
+    pub fn bind_layers(&self) -> Result<()> {
         Err(KVCacheError::NotImplemented(
-            "Python attention layer 的 KV-cache 绑定",
+            "Rust attention layer 的 KV-cache 绑定",
         ))
     }
 }
@@ -213,21 +213,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Python/Torch from mini-sglang's virtual environment"]
-    fn torch_backed_pool_exposes_k_and_v_slices() {
-        Python::attach(|py| -> Result<()> {
-            let torch = PyModule::import(py, "torch")?;
-            let dtype = torch.getattr("float32")?;
-            let layout = KVCacheLayout::new(2, 3, 4, 5, 6)?;
-            let pool = KVCachePool::new(py, layout, &dtype, "cpu")?;
-            let (k_cache, v_cache) = pool.get_all_kv_cache(py)?;
+    fn libtorch_backed_pool_exposes_k_and_v_slices() {
+        let layout = KVCacheLayout::new(2, 3, 4, 5, 6).unwrap();
+        let pool = KVCachePool::new(layout, Kind::Float, Device::Cpu).unwrap();
+        let (k_cache, v_cache) = pool.get_all_kv_cache().unwrap();
 
-            let k_shape: Vec<usize> = k_cache.bind(py).getattr("shape")?.extract()?;
-            let v_shape: Vec<usize> = v_cache.bind(py).getattr("shape")?.extract()?;
-            assert_eq!(k_shape, vec![2, 3, 4, 5, 6]);
-            assert_eq!(v_shape, vec![2, 3, 4, 5, 6]);
-            Ok(())
-        })
-        .unwrap();
+        assert_eq!(k_cache.size(), vec![2, 3, 4, 5, 6]);
+        assert_eq!(v_cache.size(), vec![2, 3, 4, 5, 6]);
     }
 }

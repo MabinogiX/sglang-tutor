@@ -1,27 +1,10 @@
-use pyo3::{Bound, Python, types::PyAny};
+use tch::{Device, Kind};
 
 use super::{KVCacheError, KVCacheLayout, KVCachePool, Result};
 
 /// The CPU fallback budget used by mini-sglang when accelerator memory metrics
 /// are unavailable.
 pub const CPU_KV_CACHE_BYTES: usize = 512 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Device {
-    Cpu,
-    Cuda,
-    Npu,
-}
-
-impl Device {
-    fn torch_name(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Cuda => "cuda",
-            Self::Npu => "npu",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KVCacheServerConfig {
@@ -44,7 +27,7 @@ pub struct KVCacheAllocationConfig {
     pub model: KVCacheModelConfig,
 }
 
-/// Computes the pool size and asks Python/Torch to allocate the backing tensor.
+/// Computes the pool size and asks libtorch to allocate the backing tensor.
 pub struct KVCacheAllocator {
     config: KVCacheAllocationConfig,
 }
@@ -75,8 +58,8 @@ impl KVCacheAllocator {
     pub fn available_memory(&self, device: Device) -> Result<usize> {
         match device {
             Device::Cpu => Ok(CPU_KV_CACHE_BYTES),
-            Device::Cuda | Device::Npu => Err(KVCacheError::NotImplemented(
-                "CUDA/NPU 空闲显存查询（依赖尚未迁移的 Python device 工具）",
+            _ => Err(KVCacheError::NotImplemented(
+                "加速器空闲显存查询（尚未迁移）",
             )),
         }
     }
@@ -110,15 +93,8 @@ impl KVCacheAllocator {
         Ok(pages_that_fit.min(max_pages_needed))
     }
 
-    /// Allocate a Torch-backed pool. `dtype` must be a Python `torch.dtype`.
-    pub fn allocate(
-        &self,
-        py: Python<'_>,
-        dtype: &Bound<'_, PyAny>,
-        dtype_itemsize: usize,
-        device: Device,
-        tp_size: usize,
-    ) -> Result<KVCachePool> {
+    /// Allocate a libtorch-backed pool.
+    pub fn allocate(&self, kind: Kind, device: Device, tp_size: usize) -> Result<KVCachePool> {
         if tp_size == 0 {
             return Err(KVCacheError::InvalidArgument(
                 "tp_size must be greater than zero".to_owned(),
@@ -127,7 +103,7 @@ impl KVCacheAllocator {
 
         let heads_per_rank = usize::max(1, self.config.model.num_kv_heads / tp_size);
         let available = self.available_memory(device)?;
-        let num_pages = self.num_pages(available, heads_per_rank, dtype_itemsize)?;
+        let num_pages = self.num_pages(available, heads_per_rank, kind.elt_size_in_bytes())?;
         let layout = KVCacheLayout::new(
             self.config.model.num_layers,
             num_pages,
@@ -135,7 +111,7 @@ impl KVCacheAllocator {
             heads_per_rank,
             self.config.model.head_dim,
         )?;
-        KVCachePool::new(py, layout, dtype, device.torch_name())
+        KVCachePool::new(layout, kind, device)
     }
 }
 
@@ -174,7 +150,7 @@ mod tests {
     #[test]
     fn accelerator_memory_lookup_is_explicitly_deferred() {
         assert!(matches!(
-            allocator().available_memory(Device::Cuda),
+            allocator().available_memory(Device::Cuda(0)),
             Err(KVCacheError::NotImplemented(_))
         ));
     }
